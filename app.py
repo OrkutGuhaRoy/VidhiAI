@@ -1,23 +1,21 @@
 # -------------------------------------------------------------------
-#                   VidhiAI - app.py (Streamlit Version)
+#                   VidhiAI - app.py (Local CPU + Unsloth)
 # -------------------------------------------------------------------
-# This app runs on your HF Space (CPU)
-# It does NOT load the model. It CALLS the model's API.
-# -------------------------------------------------------------------
-
 import streamlit as st
 import os
 import json
 import io
 import uuid
+import time
 from tavily import TavilyClient
-from huggingface_hub import HfApi, InferenceClient
+from huggingface_hub import HfApi
+from unsloth import FastLanguageModel
+from transformers import AutoTokenizer, pipeline
+from requests.exceptions import RequestException
 
 # -------------------------------------------------------------------
-# 1. PAGE CONFIGURATION (Theme & Info)
+# 1. PAGE CONFIGURATION
 # -------------------------------------------------------------------
-
-# This must be the first Streamlit command.
 st.set_page_config(
     page_title="VidhiAI - Indian Legal Assistant",
     page_icon="⚖️",
@@ -27,25 +25,19 @@ st.set_page_config(
 # -------------------------------------------------------------------
 # 2. LOAD SECRETS & CONSTANTS
 # -------------------------------------------------------------------
-# Streamlit has its own secrets manager. 
-# Add your secrets in the HF Space settings just like before.
-
 print("Loading secrets and constants...")
-
 try:
     HF_TOKEN = st.secrets["HF_TOKEN"]
     TAVILY_API_KEY = st.secrets["TAVILY_API_KEY"]
     DB_REPO_ID = st.secrets["DB_REPO"]
-    MODEL_REPO_ID = st.secrets["SPACE_ID"]
+    MODEL_REPO_ID = st.secrets["SPACE_ID"]  # this should be your model name, e.g., "SwastikGuhaRoy/VidhiAI-Model"
 except KeyError:
     st.error("ERROR: Missing secrets (HF_TOKEN, TAVILY_API_KEY, DB_REPO, or SPACE_ID). Please add them to your Space's settings.", icon="🚨")
     st.stop()
 
-
 # -------------------------------------------------------------------
-# 3. DEFINE ALL GUARDRAILS
+# 3. GUARDRAILS & CONSTANTS
 # -------------------------------------------------------------------
-
 LEGAL_KEYWORDS = ["law", "legal", "court", "act", "section", "ipc", "crpc", "fir", "india"]
 TRUSTED_DOMAINS = [
     "indiacode.nic.in", "main.sci.gov.in", "prsindia.org",
@@ -68,58 +60,91 @@ DISCLAIMER = """
 """
 
 # -------------------------------------------------------------------
-# 4. INITIALIZE API CLIENTS (Global)
+# 4. CACHED RESOURCES
 # -------------------------------------------------------------------
-print("Initializing API clients...")
-
 @st.cache_resource
-def get_api_clients():
-    """Cache the API clients so they don't re-initialize on every script run."""
-    client = InferenceClient(model=MODEL_REPO_ID, token=HF_TOKEN)
+def get_clients_and_model():
+    """Load Unsloth model + tokenizer + pipeline, and Tavily + HF API."""
+    st.info("Loading VidhiAI model locally... This may take up to a minute on first run.", icon="🧠")
+
+    # Load model locally using Unsloth
+    model_id = MODEL_REPO_ID
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_id,
+        use_fast=True,
+        token=HF_TOKEN
+    )
+    FastLanguageModel.for_inference(model)
+
+    # Build local pipeline
+    pipe = pipeline(
+        "text-generation",
+        model=model,
+        tokenizer=tokenizer
+    )
+
+    # Tavily + HF dataset API for feedback
     tavily = TavilyClient(api_key=TAVILY_API_KEY)
     hf_api = HfApi(token=HF_TOKEN)
-    return client, tavily, hf_api
 
-client, tavily, hf_api = get_api_clients()
+    return pipe, tavily, hf_api
 
 # -------------------------------------------------------------------
-# 5. HELPER FUNCTIONS (Backend Logic)
+# 5. HELPER FUNCTIONS
 # -------------------------------------------------------------------
-
-def get_search_context(query):
-    """Guardrail 2: Calls Tavily, restricted to trusted domains."""
+def get_search_context(query, tavily_client):
+    """Fetch context from trusted legal sites."""
     try:
-        search_results = tavily.search(
-            query=query, s_depth="advanced",
-            include_domains=TRUSTED_DOMAINS, max_results=3
+        search_results = tavily_client.search(
+            query=query,
+            s_depth="advanced",
+            include_domains=TRUSTED_DOMAINS,
+            max_results=3
         )
-        context = "\n".join([f"Source: {res['url']}\nContent: {res['content']}" for res in search_results['results']])
+        results = search_results.get('results') or []
+        context = "\n".join([
+            f"Source: {r.get('url')}\nContent: {r.get('content')}"
+            for r in results
+        ])
         return context if context else "No relevant information found in trusted sources."
     except Exception as e:
-        print(f"Tavily Search Error: {e}")
-        st.error(f"Error during search: {e}", icon="🌐")
+        st.error(f"Tavily Search Error: {e}", icon="🌐")
         return None
 
-def generate_response(prompt, context, temperature=0.6):
-    """Guardrail 3: Formats prompt and calls the SERVERLESS INFERENCE API."""
-    formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{SYSTEM_PROMPT}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{prompt}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"""
-    
+
+def generate_response(pipe, prompt, context, temperature=0.6):
+    """Generate text using the local pipeline."""
+    formatted_prompt = f"""<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+{SYSTEM_PROMPT}
+<|eot_id|><|start_header_id|>user<|end_header_id|>
+CONTEXT:
+{context}
+
+USER QUESTION:
+{prompt}
+<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+"""
+
     try:
-        response = client.text_generation(
-            prompt=formatted_prompt,
+        out = pipe(
+            formatted_prompt,
             max_new_tokens=512,
-            do_sample=True,
             temperature=temperature,
-            stop_sequences=["<|eot_id|>"]
-        )
-        return response
+            do_sample=True
+        )[0]["generated_text"]
+
+        # Remove prompt echoes if any
+        if "<|start_header_id|>assistant<|end_header_id|>" in out:
+            out = out.split("<|start_header_id|>assistant<|end_header_id|>")[-1].strip()
+
+        return out
     except Exception as e:
-        print(f"Inference API Error: {e}")
-        st.error(f"Model Inference Error: {e}. This can happen during a cold start. Please try again in 30 seconds.", icon="🤖")
+        st.error(f"Generation error: {e}", icon="🤖")
         return None
 
-def save_feedback(prompt, chosen, rejected):
-    """Saves feedback as a single JSON file to the HF Dataset repo."""
+
+def save_feedback(prompt, chosen, rejected, hf_api):
+    """Save feedback as JSON to HF dataset repo."""
     if not prompt or not chosen or not rejected:
         st.toast("Feedback not saved (missing data).", icon="⚠️")
         return
@@ -127,44 +152,43 @@ def save_feedback(prompt, chosen, rejected):
     chosen_cleaned = chosen.replace(DISCLAIMER, "").strip()
     rejected_cleaned = rejected.replace(DISCLAIMER, "").strip()
     data_point = {"prompt": prompt, "chosen": chosen_cleaned, "rejected": rejected_cleaned}
-    
+
     json_buffer = io.BytesIO(json.dumps(data_point).encode('utf-8'))
     filename = f"data/feedback_{uuid.uuid4()}.json"
-    
+
     try:
         hf_api.upload_file(
-            path_or_fileobj=json_buffer, path_in_repo=filename,
-            repo_id=DB_REPO_ID, repo_type="dataset"
+            path_or_fileobj=json_buffer,
+            path_in_repo=filename,
+            repo_id=DB_REPO_ID,
+            repo_type="dataset"
         )
         st.toast("Feedback saved. Thank you!", icon="✅")
     except Exception as e:
         st.error(f"Error saving feedback: {e}", icon="❌")
 
-# --- Feedback Callbacks ---
-# These functions are called by the "on_click" of the feedback buttons
-# They read from st.session_state, which stores the app's memory.
-
+# Feedback handlers
 def handle_feedback_a():
-    """Save feedback when user clicks 'A is better'"""
+    pipe, tavily, hf_api = st.session_state["_clients"]
     save_feedback(
         st.session_state.prompt,
         st.session_state.response_a,
-        st.session_state.response_b
+        st.session_state.response_b,
+        hf_api
     )
 
 def handle_feedback_b():
-    """Save feedback when user clicks 'B is better'"""
+    pipe, tavily, hf_api = st.session_state["_clients"]
     save_feedback(
         st.session_state.prompt,
         st.session_state.response_b,
-        st.session_state.response_a
+        st.session_state.response_a,
+        hf_api
     )
 
 # -------------------------------------------------------------------
-# 6. STREAMLIT UI LAYOUT
+# 6. STREAMLIT UI
 # -------------------------------------------------------------------
-
-# --- Sidebar ---
 with st.sidebar:
     st.image(
         "https://upload.wikimedia.org/wikipedia/commons/thumb/5/55/State_Emblem_of_India_%28Lions_of_Sarnath%29.svg/1200px-State_Emblem_of_India_%28Lions_of_Sarnath%29.svg.png",
@@ -173,85 +197,65 @@ with st.sidebar:
     st.title("VidhiAI")
     st.markdown("**(विध AI) - Indian Legal Info Assistant**")
     st.markdown("---")
-    st.markdown(
-        "This is a test environment. Responses are generated by an AI "
-        "and may be inaccurate. **This tool does NOT provide legal advice.**"
-    )
-    st.markdown(
-        "The model is trained by user feedback. Please vote on the "
-        "best response to help improve it."
-    )
+    st.markdown("⚠️ *This AI does not provide legal advice. It summarizes facts from Indian legal sources only.*")
     st.markdown("---")
 
-# --- Main App ---
+# Main UI
 st.title("🏛️ Ask Your Legal Question")
-st.markdown("Enter your query about Indian law below. The system will search trusted sources and provide two AI-generated answers.")
-
-# Initialize session state for storing responses
-if 'prompt' not in st.session_state:
-    st.session_state.prompt = ""
-if 'response_a' not in st.session_state:
-    st.session_state.response_a = ""
-if 'response_b' not in st.session_state:
-    st.session_state.response_b = ""
-
 prompt = st.text_area("Your Question:", placeholder="e.g., What is the procedure for filing an FIR in India?", height=150)
 submit_btn = st.button("Get Legal Info")
 
-st.markdown("---")
+# Initialize state
+for key in ["prompt", "response_a", "response_b", "_clients"]:
+    if key not in st.session_state:
+        st.session_state[key] = "" if key != "_clients" else None
 
-# --- Logic on Submit ---
 if submit_btn:
     if not prompt:
         st.error("Please enter a question.", icon="✍️")
         st.stop()
-    
-    # Guardrail 1: Input Guardrail
     if not any(word in prompt.lower() for word in LEGAL_KEYWORDS):
-        st.error("I am a legal assistant for India. Please ask a question about Indian law.", icon="⚖️")
+        st.error("Please ask a question related to Indian law.", icon="⚖️")
         st.stop()
 
-    # Run RAG and Generation
-    with st.spinner("⚖️ Searching trusted legal sources..."):
-        context = get_search_context(prompt)
-    
-    if context:
-        with st.spinner("🧠 Generating responses... (This may take 20-60s on first load)"):
-            answer_A = generate_response(prompt, context, temperature=0.5)
-            answer_B = generate_response(prompt, context, temperature=0.8)
-        
-        if answer_A and answer_B:
-            # Store responses in session state so feedback buttons can access them
-            st.session_state.prompt = prompt
-            st.session_state.response_a = answer_A + DISCLAIMER
-            st.session_state.response_b = answer_B + DISCLAIMER
-else:
-    # This keeps the old responses on screen until a new prompt is submitted
-    pass
+    # Lazy model loading
+    if st.session_state["_clients"] is None:
+        with st.spinner("🧠 Loading model & APIs..."):
+            st.session_state["_clients"] = get_clients_and_model()
 
-# --- Display Results and Feedback Buttons ---
+    pipe, tavily, hf_api = st.session_state["_clients"]
+
+    with st.spinner("⚖️ Searching trusted legal sources..."):
+        context = get_search_context(prompt, tavily)
+
+    if not context:
+        st.error("Could not retrieve any context. Try again.", icon="🌐")
+    else:
+        with st.spinner("🧾 Generating responses (locally)..."):
+            ans_a = generate_response(pipe, prompt, context, temperature=0.5)
+            ans_b = generate_response(pipe, prompt, context, temperature=0.8)
+
+        if ans_a and ans_b:
+            st.session_state.prompt = prompt
+            st.session_state.response_a = ans_a + "\n\n" + DISCLAIMER
+            st.session_state.response_b = ans_b + "\n\n" + DISCLAIMER
+        else:
+            st.error("No valid response generated.", icon="🤖")
+
+# -------------------------------------------------------------------
+# 7. DISPLAY RESULTS + FEEDBACK
+# -------------------------------------------------------------------
 if st.session_state.response_a:
     st.subheader("Generated Responses")
-    st.markdown("Please vote for the response that is more helpful.")
-    
+    st.markdown("Please vote for the response that is more factual or helpful.")
     col1, col2 = st.columns(2)
 
     with col1:
         st.info("#### Response A")
         st.markdown(st.session_state.response_a)
-        st.button(
-            "👍 Response A is better", 
-            on_click=handle_feedback_a, 
-            key="btn_a",
-            use_container_width=True
-        )
+        st.button("👍 Response A is better", on_click=handle_feedback_a, key="btn_a", use_container_width=True)
 
     with col2:
         st.info("#### Response B")
         st.markdown(st.session_state.response_b)
-        st.button(
-            "👍 Response B is better", 
-            on_click=handle_feedback_b, 
-            key="btn_b",
-            use_container_width=True
-        )
+        st.button("👍 Response B is better", on_click=handle_feedback_b, key="btn_b", use_container_width=True)
