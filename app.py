@@ -9,7 +9,8 @@ import uuid
 import time
 from tavily import TavilyClient
 from huggingface_hub import HfApi
-from transformers import AutoTokenizer,AutoModelForCausalLM, pipeline
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM , pipeline
 from requests.exceptions import RequestException
 
 # -------------------------------------------------------------------
@@ -199,4 +200,5 @@ if st.session_state.response_a:
         st.info("#### Response B")
         st.markdown(st.session_state.response_b)
         st.button("👍 Response B is better", on_click=handle_feedback_b, key="btn_b", use_container_width=True)
+
 
